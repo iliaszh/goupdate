@@ -8,7 +8,7 @@ echo "[running go mod tidy]"
 go mod tidy
 
 echo "[compiling project]"
-go build -o goupdate.exe main.go
+go build -o goupdate.exe cmd/goupdate/main.go
 
 echo "[running golangci-lint]"
 golangci-lint run
