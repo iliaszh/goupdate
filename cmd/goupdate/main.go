@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -9,41 +11,99 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/iliaszh/goupdate/internal/logerr"
 )
 
 func main() {
 	var dir string
 
-	flag.StringVar(&dir, "project-dir", "", "Project directory")
+	slog.Default()
+
+	flag.StringVar(&dir, "project-dir", "", "Project directory.")
 	flag.Parse()
 
-	if dir != "" {
-		errChDir := os.Chdir(dir)
+	goModFilePath, errGetGoModFilePath := getGoModFilePath(dir)
+	if errGetGoModFilePath != nil {
+		handleError(errGetGoModFilePath)
+		return
+	}
+
+	lines, errReadLines := readLines(goModFilePath)
+	if errReadLines != nil {
+		handleError(errReadLines)
+		return
+	}
+
+	dependencies, errGetDependencies := getDependencies(lines)
+	if errGetDependencies != nil {
+		handleError(errGetDependencies)
+		return
+	}
+
+	slog.Info(
+		"Starting updates.",
+		slog.Int("number_of_dependencies", len(dependencies)),
+	)
+	updateStartTime := time.Now()
+
+	for _, dependency := range dependencies {
+		updateDependency(dependency)
+	}
+
+	errTidy := runGoModTidy()
+	if errTidy != nil {
+		handleError(errTidy)
+		return
+	}
+
+	slog.Info(
+		"Done.",
+		slog.Duration("time_taken", time.Since(updateStartTime).Round(time.Second)),
+	)
+}
+
+func getGoModFilePath(directory string) (string, error) {
+	if directory != "" {
+		errChDir := os.Chdir(directory)
 		if errChDir != nil {
-			slog.Error("Failed to change directory.", slog.Any("error", errChDir))
-			return
+			return "", logerr.Error{
+				Message:     "Failed to change directory.",
+				InternalErr: errChDir,
+			}
 		}
 	}
 
 	workDir, errGetWorkDir := os.Getwd()
 	if errGetWorkDir != nil {
-		slog.Error("Failed to get working directory.", slog.Any("error", errGetWorkDir))
-		return
+		return "", logerr.Error{
+			Message:     "Failed to get working directory.",
+			InternalErr: errGetWorkDir,
+		}
 	}
 
-	modFileAddr := path.Join(workDir, "go.mod")
-	modFile, errOpen := os.Open(modFileAddr)
+	return path.Join(workDir, "go.mod"), nil
+}
+
+func readLines(goModFilePath string) ([]string, error) {
+	goModFile, errOpen := os.Open(goModFilePath)
 	if errOpen != nil {
-		slog.Error("Failed to open go.mod file.", slog.Any("error", errOpen))
-		return
+		return nil, logerr.Error{
+			Message:     "Failed to open go.mod file.",
+			InternalErr: errOpen,
+		}
 	}
+	defer func() { _ = goModFile.Close() }()
 
-	defer func() { _ = modFile.Close() }()
+	slog.Info("Found go.mod file.")
 
-	fileBytes, errReadAll := io.ReadAll(modFile)
+	fileBytes, errReadAll := io.ReadAll(goModFile)
 	if errReadAll != nil {
-		slog.Error("Failed to read go.mod file.", slog.Any("error", errReadAll))
-		return
+		return nil, logerr.Error{
+			Message:     "Failed to read go.mod file.",
+			InternalErr: errReadAll,
+		}
 	}
 
 	lines := strings.Split(string(fileBytes), "\n")
@@ -52,20 +112,50 @@ func main() {
 		lines[i] = strings.TrimSpace(line)
 	}
 
-	requireBlockStartIdx := slices.IndexFunc(lines, func(line string) bool {
-		return line == "require ("
-	})
-	if requireBlockStartIdx < 0 {
-		slog.Info("No require block found.")
+	return lines, nil
+}
+
+func handleError(err error) {
+	var logErr logerr.Error
+	if errors.As(err, &logErr) {
+		slog.Error(logErr.Message, slog.Any("error", logErr.InternalErr))
 		return
 	}
 
-	requireBlockEndIdx := slices.IndexFunc(lines, func(line string) bool {
-		return line == ")"
-	})
+	slog.Error("Unexpected error!", slog.Any("error", err))
+}
+
+func getDependencies(lines []string) ([]string, error) {
+	equalTo := func(value string) func(string) bool {
+		return func(line string) bool {
+			return line == value
+		}
+	}
+
+	const (
+		requireBlockStart = "require ("
+		requireBlockEnd   = ")"
+	)
+
+	requireBlockStartIdx := slices.IndexFunc(lines, equalTo(requireBlockStart))
+	if requireBlockStartIdx < 0 {
+		slog.Info("No require block found.")
+		return nil, nil
+	}
+
+	requireBlockEndIdx := slices.IndexFunc(lines, equalTo(requireBlockEnd))
 	if requireBlockEndIdx < 0 {
-		slog.Error("Did not find the end of require block.")
-		return
+		return nil, logerr.Error{
+			Message:     "Did not find the end of require block.",
+			InternalErr: fmt.Errorf("no %q found", requireBlockEnd),
+		}
+	}
+
+	if requireBlockStartIdx > requireBlockEndIdx {
+		return nil, logerr.Error{
+			Message:     "Invalid syntax in go.mod file.",
+			InternalErr: fmt.Errorf("%q found after %q", requireBlockStart, requireBlockEnd),
+		}
 	}
 
 	directDependencies := lines[requireBlockStartIdx+1 : requireBlockEndIdx]
@@ -74,25 +164,41 @@ func main() {
 		directDependencies[i] = dependency
 	}
 
-	for _, dependency := range directDependencies {
-		cmd := exec.Command("go", "get", "-u", dependency)
+	return directDependencies, nil
+}
 
-		slog.Info("Updating dependency...", slog.String("dependency", dependency))
+func updateDependency(dependency string) {
+	start := time.Now()
 
-		errRun := cmd.Run()
-		if errRun != nil {
-			slog.Error(
-				"Failed to update dependency.",
-				slog.String("dependency", dependency),
-				slog.Any("error", errRun),
-			)
-			break
+	cmd := exec.Command("go", "get", "-u", dependency)
+
+	errRun := cmd.Run()
+	if errRun != nil {
+		slog.Error(
+			"Failed to update dependency.",
+			slog.String("dependency", dependency),
+			slog.Any("error", errRun),
+		)
+		return
+	}
+
+	slog.Info(
+		"Update successful.",
+		slog.String("dependency", dependency),
+		slog.Duration("time_taken", time.Since(start).Round(time.Second)),
+	)
+}
+
+func runGoModTidy() error {
+	slog.Info("Running go mod tidy...")
+
+	errModTidy := exec.Command("go", "mod", "tidy").Run()
+	if errModTidy != nil {
+		return logerr.Error{
+			Message:     "Failed to run go mod tidy.",
+			InternalErr: errModTidy,
 		}
 	}
 
-	slog.Info("Running go mod tidy...")
-	errModTidy := exec.Command("go", "mod", "tidy").Run()
-	if errModTidy != nil {
-		slog.Error("Failed to run go mod tidy.", slog.Any("error", errModTidy))
-	}
+	return nil
 }
